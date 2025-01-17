@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/buildx/driver"
@@ -16,32 +17,45 @@ import (
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
-	"github.com/docker/docker/api/types"
-	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/cli/opts"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/system"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	dockerarchive "github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/util/tracing/detect"
 	"github.com/pkg/errors"
 )
 
 const (
-	volumeStateSuffix = "_state"
+	volumeStateSuffix   = "_state"
+	buildkitdConfigFile = "buildkitd.toml"
 )
 
 type Driver struct {
 	driver.InitConfig
-	factory      driver.Factory
-	userNSRemap  bool // true if dockerd is running with userns-remap mode
-	netMode      string
-	image        string
-	cgroupParent string
-	env          []string
+	factory driver.Factory
+
+	// if you add fields, remember to update docs:
+	// https://github.com/docker/docs/blob/main/content/build/drivers/docker-container.md
+	netMode       string
+	image         string
+	memory        opts.MemBytes
+	memorySwap    opts.MemSwapBytes
+	cpuQuota      int64
+	cpuPeriod     int64
+	cpuShares     int64
+	cpusetCpus    string
+	cpusetMems    string
+	cgroupParent  string
+	restartPolicy container.RestartPolicy
+	env           []string
+	defaultLoad   bool
 }
 
 func (d *Driver) IsMobyDriver() bool {
@@ -62,13 +76,10 @@ func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 			return err
 		}
 		return sub.Wrap("starting container "+d.Name, func() error {
-			if err := d.start(ctx, sub); err != nil {
+			if err := d.start(ctx); err != nil {
 				return err
 			}
-			if err := d.wait(ctx, sub); err != nil {
-				return err
-			}
-			return nil
+			return d.wait(ctx, sub)
 		})
 	})
 }
@@ -84,7 +95,7 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 		if err != nil {
 			return err
 		}
-		rc, err := d.DockerAPI.ImageCreate(ctx, imageName, types.ImageCreateOptions{
+		rc, err := d.DockerAPI.ImageCreate(ctx, imageName, image.CreateOptions{
 			RegistryAuth: ra,
 		})
 		if err != nil {
@@ -106,13 +117,13 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 		Image: imageName,
 		Env:   d.env,
 	}
-	if d.InitConfig.BuildkitFlags != nil {
-		cfg.Cmd = d.InitConfig.BuildkitFlags
-	}
+	cfg.Cmd = getBuildkitFlags(d.InitConfig)
 
-	if err := l.Wrap("creating container "+d.Name, func() error {
+	useInit := true // let it cleanup exited processes created by BuildKit's container API
+	return l.Wrap("creating container "+d.Name, func() error {
 		hc := &container.HostConfig{
-			Privileged: true,
+			Privileged:    true,
+			RestartPolicy: d.restartPolicy,
 			Mounts: []mount.Mount{
 				{
 					Type:   mount.TypeVolume,
@@ -120,39 +131,67 @@ func (d *Driver) create(ctx context.Context, l progress.SubLogger) error {
 					Target: confutil.DefaultBuildKitStateDir,
 				},
 			},
-		}
-		if d.userNSRemap {
-			hc.UsernsMode = "host"
+			Init: &useInit,
 		}
 		if d.netMode != "" {
 			hc.NetworkMode = container.NetworkMode(d.netMode)
 		}
-		if info, err := d.DockerAPI.Info(ctx); err == nil && info.CgroupDriver == "cgroupfs" {
-			// Place all buildkit containers inside this cgroup by default so limits can be attached
-			// to all build activity on the host.
-			hc.CgroupParent = "/docker/buildx"
-			if d.cgroupParent != "" {
-				hc.CgroupParent = d.cgroupParent
+		if d.memory != 0 {
+			hc.Resources.Memory = int64(d.memory)
+		}
+		if d.memorySwap != 0 {
+			hc.Resources.MemorySwap = int64(d.memorySwap)
+		}
+		if d.cpuQuota != 0 {
+			hc.Resources.CPUQuota = d.cpuQuota
+		}
+		if d.cpuPeriod != 0 {
+			hc.Resources.CPUPeriod = d.cpuPeriod
+		}
+		if d.cpuShares != 0 {
+			hc.Resources.CPUShares = d.cpuShares
+		}
+		if d.cpusetCpus != "" {
+			hc.Resources.CpusetCpus = d.cpusetCpus
+		}
+		if d.cpusetMems != "" {
+			hc.Resources.CpusetMems = d.cpusetMems
+		}
+		if info, err := d.DockerAPI.Info(ctx); err == nil {
+			if info.CgroupDriver == "cgroupfs" {
+				// Place all buildkit containers inside this cgroup by default so limits can be attached
+				// to all build activity on the host.
+				hc.CgroupParent = "/docker/buildx"
+				if d.cgroupParent != "" {
+					hc.CgroupParent = d.cgroupParent
+				}
+			}
+
+			secOpts, err := system.DecodeSecurityOptions(info.SecurityOptions)
+			if err != nil {
+				return err
+			}
+			for _, f := range secOpts {
+				if f.Name == "userns" {
+					hc.UsernsMode = "host"
+					break
+				}
 			}
 		}
 		_, err := d.DockerAPI.ContainerCreate(ctx, cfg, hc, &network.NetworkingConfig{}, nil, d.Name)
-		if err != nil {
+		if err != nil && !errdefs.IsConflict(err) {
 			return err
 		}
-		if err := d.copyToContainer(ctx, d.InitConfig.Files); err != nil {
-			return err
+		if err == nil {
+			if err := d.copyToContainer(ctx, d.InitConfig.Files); err != nil {
+				return err
+			}
+			if err := d.start(ctx); err != nil {
+				return err
+			}
 		}
-		if err := d.start(ctx, l); err != nil {
-			return err
-		}
-		if err := d.wait(ctx, l); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return nil
+		return d.wait(ctx, l)
+	})
 }
 
 func (d *Driver) wait(ctx context.Context, l progress.SubLogger) error {
@@ -162,20 +201,18 @@ func (d *Driver) wait(ctx context.Context, l progress.SubLogger) error {
 		bufStderr := &bytes.Buffer{}
 		if err := d.run(ctx, []string{"buildctl", "debug", "workers"}, bufStdout, bufStderr); err != nil {
 			if try > 15 {
-				if err != nil {
-					d.copyLogs(context.TODO(), l)
-					if bufStdout.Len() != 0 {
-						l.Log(1, bufStdout.Bytes())
-					}
-					if bufStderr.Len() != 0 {
-						l.Log(2, bufStderr.Bytes())
-					}
+				d.copyLogs(context.TODO(), l)
+				if bufStdout.Len() != 0 {
+					l.Log(1, bufStdout.Bytes())
+				}
+				if bufStderr.Len() != 0 {
+					l.Log(2, bufStderr.Bytes())
 				}
 				return err
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-time.After(time.Duration(try*120) * time.Millisecond):
 				try++
 				continue
@@ -186,7 +223,7 @@ func (d *Driver) wait(ctx context.Context, l progress.SubLogger) error {
 }
 
 func (d *Driver) copyLogs(ctx context.Context, l progress.SubLogger) error {
-	rc, err := d.DockerAPI.ContainerLogs(ctx, d.Name, types.ContainerLogsOptions{
+	rc, err := d.DockerAPI.ContainerLogs(ctx, d.Name, container.LogsOptions{
 		ShowStdout: true, ShowStderr: true,
 	})
 	if err != nil {
@@ -215,17 +252,18 @@ func (d *Driver) copyToContainer(ctx context.Context, files map[string][]byte) e
 		return err
 	}
 	defer srcArchive.Close()
-	return d.DockerAPI.CopyToContainer(ctx, d.Name, "/", srcArchive, dockertypes.CopyToContainerOptions{})
+
+	baseDir := path.Dir(confutil.DefaultBuildKitConfigDir)
+	return d.DockerAPI.CopyToContainer(ctx, d.Name, baseDir, srcArchive, container.CopyToContainerOptions{})
 }
 
 func (d *Driver) exec(ctx context.Context, cmd []string) (string, net.Conn, error) {
-	execConfig := types.ExecConfig{
+	response, err := d.DockerAPI.ContainerExecCreate(ctx, d.Name, container.ExecOptions{
 		Cmd:          cmd,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-	}
-	response, err := d.DockerAPI.ContainerExecCreate(ctx, d.Name, execConfig)
+	})
 	if err != nil {
 		return "", nil, err
 	}
@@ -235,7 +273,7 @@ func (d *Driver) exec(ctx context.Context, cmd []string) (string, net.Conn, erro
 		return "", nil, errors.New("exec ID empty")
 	}
 
-	resp, err := d.DockerAPI.ContainerExecAttach(ctx, execID, types.ExecStartCheck{})
+	resp, err := d.DockerAPI.ContainerExecAttach(ctx, execID, container.ExecStartOptions{})
 	if err != nil {
 		return "", nil, err
 	}
@@ -261,8 +299,8 @@ func (d *Driver) run(ctx context.Context, cmd []string, stdout, stderr io.Writer
 	return nil
 }
 
-func (d *Driver) start(ctx context.Context, l progress.SubLogger) error {
-	return d.DockerAPI.ContainerStart(ctx, d.Name, types.ContainerStartOptions{})
+func (d *Driver) start(ctx context.Context) error {
+	return d.DockerAPI.ContainerStart(ctx, d.Name, container.StartOptions{})
 }
 
 func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
@@ -320,18 +358,18 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 		return err
 	}
 	if info.Status != driver.Inactive {
-		container, err := d.DockerAPI.ContainerInspect(ctx, d.Name)
+		ctr, err := d.DockerAPI.ContainerInspect(ctx, d.Name)
 		if err != nil {
 			return err
 		}
 		if rmDaemon {
-			if err := d.DockerAPI.ContainerRemove(ctx, d.Name, dockertypes.ContainerRemoveOptions{
+			if err := d.DockerAPI.ContainerRemove(ctx, d.Name, container.RemoveOptions{
 				RemoveVolumes: true,
 				Force:         force,
 			}); err != nil {
 				return err
 			}
-			for _, v := range container.Mounts {
+			for _, v := range ctr.Mounts {
 				if v.Name != d.Name+volumeStateSuffix {
 					continue
 				}
@@ -344,44 +382,58 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 	return nil
 }
 
-func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
+func (d *Driver) Dial(ctx context.Context) (net.Conn, error) {
 	_, conn, err := d.exec(ctx, []string{"buildctl", "dial-stdio"})
 	if err != nil {
 		return nil, err
 	}
-
 	conn = demuxConn(conn)
+	return conn, nil
+}
 
-	exp, err := detect.Exporter()
+func (d *Driver) Client(ctx context.Context, opts ...client.ClientOpt) (*client.Client, error) {
+	conn, err := d.Dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	td, _ := exp.(client.TracerDelegate)
-
-	return client.New(ctx, "", client.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-		return conn, nil
-	}), client.WithTracerDelegate(td))
+	var counter int64
+	opts = append([]client.ClientOpt{
+		client.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			if atomic.AddInt64(&counter, 1) > 1 {
+				return nil, net.ErrClosed
+			}
+			return conn, nil
+		}),
+	}, opts...)
+	return client.New(ctx, "", opts...)
 }
 
 func (d *Driver) Factory() driver.Factory {
 	return d.factory
 }
 
-func (d *Driver) Features() map[driver.Feature]bool {
+func (d *Driver) Features(ctx context.Context) map[driver.Feature]bool {
 	return map[driver.Feature]bool{
 		driver.OCIExporter:    true,
 		driver.DockerExporter: true,
-
-		driver.CacheExport:   true,
-		driver.MultiPlatform: true,
+		driver.CacheExport:    true,
+		driver.MultiPlatform:  true,
+		driver.DefaultLoad:    d.defaultLoad,
 	}
+}
+
+func (d *Driver) HostGatewayIP(ctx context.Context) (net.IP, error) {
+	return nil, errors.New("host-gateway is not supported by the docker-container driver")
 }
 
 func demuxConn(c net.Conn) net.Conn {
 	pr, pw := io.Pipe()
 	// TODO: rewrite parser with Reader() to avoid goroutine switch
-	go stdcopy.StdCopy(pw, os.Stderr, c)
+	go func() {
+		_, err := stdcopy.StdCopy(pw, os.Stderr, c)
+		pw.CloseWithError(err)
+	}()
 	return &demux{
 		Conn:   c,
 		Reader: pr,
@@ -418,15 +470,34 @@ func writeConfigFiles(m map[string][]byte) (_ string, err error) {
 			os.RemoveAll(tmpDir)
 		}
 	}()
+	configDir := filepath.Base(confutil.DefaultBuildKitConfigDir)
 	for f, dt := range m {
-		f = path.Join(confutil.DefaultBuildKitConfigDir, f)
-		p := filepath.Join(tmpDir, f)
-		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		p := filepath.Join(tmpDir, configDir, f)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(p, dt, 0600); err != nil {
+		if err := os.WriteFile(p, dt, 0644); err != nil {
 			return "", err
 		}
 	}
 	return tmpDir, nil
+}
+
+func getBuildkitFlags(initConfig driver.InitConfig) []string {
+	flags := initConfig.BuildkitdFlags
+	if _, ok := initConfig.Files[buildkitdConfigFile]; ok {
+		// There's no way for us to determine the appropriate default configuration
+		// path and the default path can vary depending on if the image is normal
+		// or rootless.
+		//
+		// In order to ensure that --config works, copy to a specific path and
+		// specify the location.
+		//
+		// This should be appended before the user-specified arguments
+		// so that this option could be overwritten by the user.
+		newFlags := make([]string, 0, len(flags)+2)
+		newFlags = append(newFlags, "--config", path.Join("/etc/buildkit", buildkitdConfigFile))
+		flags = append(newFlags, flags...)
+	}
+	return flags
 }

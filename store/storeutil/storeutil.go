@@ -7,34 +7,21 @@ import (
 
 	"github.com/docker/buildx/store"
 	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/resolver"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/cli/cli/context/docker"
 	buildkitdconfig "github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/pkg/errors"
 )
 
 // GetStore returns current builder instance store
 func GetStore(dockerCli command.Cli) (*store.Txn, func(), error) {
-	s, err := store.New(confutil.ConfigDir(dockerCli))
+	s, err := store.New(confutil.NewConfig(dockerCli))
 	if err != nil {
 		return nil, nil, err
 	}
 	return s.Txn()
-}
-
-// GetCurrentEndpoint returns the current default endpoint value
-func GetCurrentEndpoint(dockerCli command.Cli) (string, error) {
-	name := dockerCli.CurrentContext()
-	if name != "default" {
-		return name, nil
-	}
-	de, err := GetDockerEndpoint(dockerCli, name)
-	if err != nil {
-		return "", errors.Errorf("docker endpoint for %q not found", name)
-	}
-	return de, nil
 }
 
 func GetProxyConfig(dockerCli command.Cli) map[string]string {
@@ -63,31 +50,9 @@ func GetProxyConfig(dockerCli command.Cli) map[string]string {
 	return m
 }
 
-// GetDockerEndpoint returns docker endpoint string for given context
-func GetDockerEndpoint(dockerCli command.Cli, name string) (string, error) {
-	list, err := dockerCli.ContextStore().List()
-	if err != nil {
-		return "", err
-	}
-	for _, l := range list {
-		if l.Name == name {
-			ep, ok := l.Endpoints["docker"]
-			if !ok {
-				return "", errors.Errorf("context %q does not have a Docker endpoint", name)
-			}
-			typed, ok := ep.(docker.EndpointMeta)
-			if !ok {
-				return "", errors.Errorf("endpoint %q is not of type EndpointMeta, %T", ep, ep)
-			}
-			return typed.Host, nil
-		}
-	}
-	return "", nil
-}
-
 // GetCurrentInstance finds the current builder instance
 func GetCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup, error) {
-	ep, err := GetCurrentEndpoint(dockerCli)
+	ep, err := dockerutil.GetCurrentEndpoint(dockerCli)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +61,10 @@ func GetCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup
 		return nil, err
 	}
 	if ng == nil {
-		ng, _ = GetNodeGroup(txn, dockerCli, dockerCli.CurrentContext())
+		ng, err = GetNodeGroup(txn, dockerCli, dockerCli.CurrentContext())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return ng, nil
@@ -106,16 +74,12 @@ func GetCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup
 func GetNodeGroup(txn *store.Txn, dockerCli command.Cli, name string) (*store.NodeGroup, error) {
 	ng, err := txn.NodeGroupByName(name)
 	if err != nil {
-		if !os.IsNotExist(errors.Cause(err)) {
+		if !os.IsNotExist(errors.Cause(err)) && !store.IsErrInvalidName(err) {
 			return nil, err
 		}
 	}
 	if ng != nil {
 		return ng, nil
-	}
-
-	if name == "default" {
-		name = dockerCli.CurrentContext()
 	}
 
 	list, err := dockerCli.ContextStore().List()
@@ -124,15 +88,20 @@ func GetNodeGroup(txn *store.Txn, dockerCli command.Cli, name string) (*store.No
 	}
 	for _, l := range list {
 		if l.Name == name {
-			return &store.NodeGroup{
-				Name: "default",
+			ng = &store.NodeGroup{
+				Name: name,
 				Nodes: []store.Node{
 					{
-						Name:     "default",
+						Name:     name,
 						Endpoint: name,
 					},
 				},
-			}, nil
+				DockerContext: true,
+			}
+			if ng.LastActivity, err = txn.GetLastActivity(ng); err != nil {
+				return nil, err
+			}
+			return ng, nil
 		}
 	}
 

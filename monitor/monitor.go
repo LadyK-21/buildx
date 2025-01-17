@@ -1,66 +1,123 @@
 package monitor
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
+	"sync/atomic"
+	"text/tabwriter"
 
+	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/controller/control"
+	controllerapi "github.com/docker/buildx/controller/pb"
+	"github.com/docker/buildx/monitor/commands"
+	"github.com/docker/buildx/monitor/types"
+	"github.com/docker/buildx/util/ioset"
+	"github.com/docker/buildx/util/progress"
+	"github.com/google/shlex"
+	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/identity"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 )
 
-const helpMessage = `
-Available commads are:
-  reload   reloads the context and build it.
-  rollback re-runs the interactive container with initial rootfs contents.
-  exit     exits monitor.
-  help     shows this message.
-`
+type MonitorBuildResult struct {
+	Resp *client.SolveResponse
+	Err  error
+}
 
 // RunMonitor provides an interactive session for running and managing containers via specified IO.
-func RunMonitor(ctx context.Context, containerConfig build.ContainerConfig, reloadFunc func(context.Context) (*build.ResultContext, error), stdin io.ReadCloser, stdout, stderr io.WriteCloser) error {
-	monitorIn, monitorOut := ioSetPipe()
-	defer monitorIn.Close()
+func RunMonitor(ctx context.Context, curRef string, options *controllerapi.BuildOptions, invokeConfig *controllerapi.InvokeConfig, c control.BuildxController, stdin io.ReadCloser, stdout io.WriteCloser, stderr console.File, progress *progress.Printer) (*MonitorBuildResult, error) {
+	defer func() {
+		if err := c.Disconnect(ctx, curRef); err != nil {
+			logrus.Warnf("disconnect error: %v", err)
+		}
+	}()
+
+	if err := progress.Pause(); err != nil {
+		return nil, err
+	}
+	defer progress.Unpause()
+
+	monitorIn, monitorOut := ioset.Pipe()
+	defer func() {
+		monitorIn.Close()
+	}()
 	monitorEnableCh := make(chan struct{})
 	monitorDisableCh := make(chan struct{})
-	monitorOutCtx := ioSetOutContext{monitorOut,
-		func() { monitorEnableCh <- struct{}{} },
-		func() { monitorDisableCh <- struct{}{} },
+	monitorOutCtx := ioset.MuxOut{
+		Out:         monitorOut,
+		EnableHook:  func() { monitorEnableCh <- struct{}{} },
+		DisableHook: func() { monitorDisableCh <- struct{}{} },
 	}
 
-	containerIn, containerOut := ioSetPipe()
-	defer containerIn.Close()
-	containerOutCtx := ioSetOutContext{containerOut,
+	containerIn, containerOut := ioset.Pipe()
+	defer func() {
+		containerIn.Close()
+	}()
+	containerOutCtx := ioset.MuxOut{
+		Out: containerOut,
 		// send newline to hopefully get the prompt; TODO: better UI (e.g. reprinting the last line)
-		func() { containerOut.stdin.Write([]byte("\n")) },
-		func() {},
+		EnableHook:  func() { containerOut.Stdin.Write([]byte("\n")) },
+		DisableHook: func() {},
 	}
 
+	invokeForwarder := ioset.NewForwarder()
+	invokeForwarder.SetIn(&containerIn)
 	m := &monitor{
-		invokeIO: newIOForwarder(containerIn),
-		muxIO: newMuxIO(ioSetIn{stdin, stdout, stderr}, []ioSetOutContext{monitorOutCtx, containerOutCtx}, 1, func(prev int, res int) string {
+		BuildxController: c,
+		invokeIO:         invokeForwarder,
+		muxIO: ioset.NewMuxIO(ioset.In{
+			Stdin:  io.NopCloser(stdin),
+			Stdout: nopCloser{stdout},
+			Stderr: nopCloser{stderr},
+		}, []ioset.MuxOut{monitorOutCtx, containerOutCtx}, 1, func(prev int, res int) string {
 			if prev == 0 && res == 0 {
 				// No toggle happened because container I/O isn't enabled.
-				return "No running interactive containers. You can start one by issuing rollback command\n"
+				return "Process isn't attached (previous \"exec\" exited?). Use \"attach\" for attaching or \"rollback\" or \"exec\" for running new one.\n"
 			}
 			return "Switched IO\n"
 		}),
 	}
+	m.ref.Store(curRef)
 
 	// Start container automatically
 	fmt.Fprintf(stdout, "Launching interactive container. Press Ctrl-a-c to switch to monitor console\n")
-	m.rollback(ctx, containerConfig)
+	invokeConfig.Rollback = false
+	invokeConfig.Initial = false
+	id := m.Rollback(ctx, invokeConfig)
+	fmt.Fprintf(stdout, "Interactive container was restarted with process %q. Press Ctrl-a-c to switch to the new container\n", id)
+
+	availableCommands := []types.Command{
+		commands.NewReloadCmd(m, stdout, progress, options, invokeConfig),
+		commands.NewRollbackCmd(m, invokeConfig, stdout),
+		commands.NewListCmd(m, stdout),
+		commands.NewDisconnectCmd(m),
+		commands.NewKillCmd(m),
+		commands.NewAttachCmd(m, stdout),
+		commands.NewExecCmd(m, invokeConfig, stdout),
+		commands.NewPsCmd(m, stdout),
+	}
+	registeredCommands := make(map[string]types.Command)
+	for _, c := range availableCommands {
+		registeredCommands[c.Info().Name] = c
+	}
+	additionalHelpMessages := map[string]string{
+		"help": "shows this message. Optionally pass a command name as an argument to print the detailed usage.",
+		"exit": "exits monitor",
+	}
 
 	// Serve monitor commands
-	monitorForwarder := newIOForwarder(monitorIn)
+	monitorForwarder := ioset.NewForwarder()
+	monitorForwarder.SetIn(&monitorIn)
 	for {
 		<-monitorEnableCh
-		in, out := ioSetPipe()
-		monitorForwarder.setDestination(&out)
+		in, out := ioset.Pipe()
+		monitorForwarder.SetOut(&out)
 		doneCh, errCh := make(chan struct{}), make(chan error)
 		go func() {
 			defer close(doneCh)
@@ -69,7 +126,7 @@ func RunMonitor(ctx context.Context, containerConfig build.ContainerConfig, relo
 				<-ctx.Done()
 				in.Close()
 			}()
-			t := term.NewTerminal(readWriter{in.stdin, in.stdout}, "(buildx) ")
+			t := term.NewTerminal(readWriter{in.Stdin, in.Stdout}, "(buildx) ")
 			for {
 				l, err := t.ReadLine()
 				if err != nil {
@@ -79,47 +136,95 @@ func RunMonitor(ctx context.Context, containerConfig build.ContainerConfig, relo
 					}
 					return
 				}
-				switch l {
+				args, err := shlex.Split(l)
+				if err != nil {
+					fmt.Fprintf(stdout, "monitor: failed to parse command: %v", err)
+					continue
+				} else if len(args) == 0 {
+					continue
+				}
+
+				// Builtin commands
+				switch args[0] {
 				case "":
 					// nop
-				case "reload":
-					res, err := reloadFunc(ctx)
-					if err != nil {
-						fmt.Printf("failed to reload: %v\n", err)
-					} else {
-						// rollback the running container with the new result
-						containerConfig.ResultCtx = res
-						m.rollback(ctx, containerConfig)
-						fmt.Fprint(stdout, "Interactive container was restarted. Press Ctrl-a-c to switch to the new container\n")
-					}
-				case "rollback":
-					m.rollback(ctx, containerConfig)
-					fmt.Fprint(stdout, "Interactive container was restarted. Press Ctrl-a-c to switch to the new container\n")
+					continue
 				case "exit":
 					return
 				case "help":
-					fmt.Fprint(stdout, helpMessage)
+					if len(args) >= 2 {
+						printHelpMessageOfCommand(stdout, args[1], registeredCommands, additionalHelpMessages)
+						continue
+					}
+					printHelpMessage(stdout, registeredCommands, additionalHelpMessages)
+					continue
 				default:
-					fmt.Printf("unknown command: %q\n", l)
-					fmt.Fprint(stdout, helpMessage)
+				}
+
+				// Registered commands
+				cmdname := args[0]
+				if cm, ok := registeredCommands[cmdname]; ok {
+					if err := cm.Exec(ctx, args); err != nil {
+						fmt.Fprintf(stdout, "%s: %v\n", cmdname, err)
+					}
+				} else {
+					fmt.Fprintf(stdout, "monitor: unknown command: %q\n", l)
+					printHelpMessage(stdout, registeredCommands, additionalHelpMessages)
 				}
 			}
 		}()
 		select {
 		case <-doneCh:
-			if m.curInvokeCancel != nil {
-				m.curInvokeCancel()
-			}
-			return nil
+			m.close()
+			return m.lastBuildResult, nil
 		case err := <-errCh:
-			if m.curInvokeCancel != nil {
-				m.curInvokeCancel()
-			}
-			return err
+			m.close()
+			return m.lastBuildResult, err
 		case <-monitorDisableCh:
 		}
-		monitorForwarder.setDestination(nil)
+		monitorForwarder.SetOut(nil)
 	}
+}
+
+func printHelpMessageOfCommand(out io.Writer, name string, registeredCommands map[string]types.Command, additional map[string]string) {
+	var target types.Command
+	if c, ok := registeredCommands[name]; ok {
+		target = c
+	} else {
+		fmt.Fprintf(out, "monitor: no help message for %q\n", name)
+		printHelpMessage(out, registeredCommands, additional)
+		return
+	}
+	fmt.Fprintln(out, target.Info().HelpMessage)
+	if h := target.Info().HelpMessageLong; h != "" {
+		fmt.Fprintln(out, h)
+	}
+}
+
+func printHelpMessage(out io.Writer, registeredCommands map[string]types.Command, additional map[string]string) {
+	var names []string
+	for name := range registeredCommands {
+		names = append(names, name)
+	}
+	for name := range additional {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprint(out, "Available commands are:\n")
+	w := new(tabwriter.Writer)
+	w.Init(out, 0, 8, 0, '\t', 0)
+	for _, name := range names {
+		var mes string
+		if c, ok := registeredCommands[name]; ok {
+			mes = c.Info().HelpMessage
+		} else if m, ok := additional[name]; ok {
+			mes = m
+		} else {
+			continue
+		}
+		fmt.Fprintln(w, "  "+name+"\t"+mes)
+	}
+	w.Flush()
 }
 
 type readWriter struct {
@@ -128,389 +233,124 @@ type readWriter struct {
 }
 
 type monitor struct {
-	muxIO           *muxIO
-	invokeIO        *ioForwarder
-	curInvokeCancel func()
+	control.BuildxController
+	ref atomic.Value
+
+	muxIO        *ioset.MuxIO
+	invokeIO     *ioset.Forwarder
+	invokeCancel func()
+	attachedPid  atomic.Value
+
+	lastBuildResult *MonitorBuildResult
 }
 
-func (m *monitor) rollback(ctx context.Context, cfg build.ContainerConfig) {
-	if m.curInvokeCancel != nil {
-		m.curInvokeCancel() // Finish the running container if exists
+func (m *monitor) Build(ctx context.Context, options *controllerapi.BuildOptions, in io.ReadCloser, progress progress.Writer) (ref string, resp *client.SolveResponse, input *build.Inputs, err error) {
+	ref, resp, _, err = m.BuildxController.Build(ctx, options, in, progress)
+	m.lastBuildResult = &MonitorBuildResult{Resp: resp, Err: err} // Record build result
+	return
+}
+
+func (m *monitor) DisconnectSession(ctx context.Context, targetID string) error {
+	return m.Disconnect(ctx, targetID)
+}
+
+func (m *monitor) AttachSession(ref string) {
+	m.ref.Store(ref)
+}
+
+func (m *monitor) AttachedSessionID() string {
+	return m.ref.Load().(string)
+}
+
+func (m *monitor) Rollback(ctx context.Context, cfg *controllerapi.InvokeConfig) string {
+	pid := identity.NewID()
+	cfg1 := cfg
+	cfg1.Rollback = true
+	return m.startInvoke(ctx, pid, cfg1)
+}
+
+func (m *monitor) Exec(ctx context.Context, cfg *controllerapi.InvokeConfig) string {
+	return m.startInvoke(ctx, identity.NewID(), cfg)
+}
+
+func (m *monitor) Attach(ctx context.Context, pid string) {
+	m.startInvoke(ctx, pid, &controllerapi.InvokeConfig{})
+}
+
+func (m *monitor) Detach() {
+	if m.invokeCancel != nil {
+		m.invokeCancel() // Finish existing attach
+	}
+}
+
+func (m *monitor) AttachedPID() string {
+	return m.attachedPid.Load().(string)
+}
+
+func (m *monitor) close() {
+	m.Detach()
+}
+
+func (m *monitor) startInvoke(ctx context.Context, pid string, cfg *controllerapi.InvokeConfig) string {
+	if m.invokeCancel != nil {
+		m.invokeCancel() // Finish existing attach
+	}
+	if len(cfg.Entrypoint) == 0 && len(cfg.Cmd) == 0 {
+		cfg.Entrypoint = []string{"sh"} // launch shell by default
+		cfg.Cmd = []string{}
+		cfg.NoCmd = false
 	}
 	go func() {
-		// Start a new container
-		if err := m.invoke(ctx, cfg); err != nil {
-			logrus.Debugf("invoke error: %v", err)
+		// Start a new invoke
+		if err := m.invoke(ctx, pid, cfg); err != nil {
+			if errors.Is(err, context.Canceled) {
+				logrus.Debugf("process canceled: %v", err)
+			} else {
+				logrus.Errorf("invoke: %v", err)
+			}
+		}
+		if pid == m.attachedPid.Load() {
+			m.attachedPid.Store("")
 		}
 	}()
+	m.attachedPid.Store(pid)
+	return pid
 }
 
-func (m *monitor) invoke(ctx context.Context, cfg build.ContainerConfig) error {
-	m.muxIO.enable(1)
-	defer m.muxIO.disable(1)
-	invokeCtx, invokeCancel := context.WithCancel(ctx)
+func (m *monitor) invoke(ctx context.Context, pid string, cfg *controllerapi.InvokeConfig) error {
+	m.muxIO.Enable(1)
+	defer m.muxIO.Disable(1)
+	if err := m.muxIO.SwitchTo(1); err != nil {
+		return errors.Errorf("failed to switch to process IO: %v", err)
+	}
+	if m.AttachedSessionID() == "" {
+		return nil
+	}
+	invokeCtx, invokeCancel := context.WithCancelCause(ctx)
 
-	containerIn, containerOut := ioSetPipe()
-	m.invokeIO.setDestination(&containerOut)
+	containerIn, containerOut := ioset.Pipe()
+	m.invokeIO.SetOut(&containerOut)
 	waitInvokeDoneCh := make(chan struct{})
 	var cancelOnce sync.Once
-	curInvokeCancel := func() {
+	invokeCancelAndDetachFn := func() {
 		cancelOnce.Do(func() {
 			containerIn.Close()
-			m.invokeIO.setDestination(nil)
-			invokeCancel()
+			m.invokeIO.SetOut(nil)
+			invokeCancel(errors.WithStack(context.Canceled))
 		})
 		<-waitInvokeDoneCh
 	}
-	defer curInvokeCancel()
-	m.curInvokeCancel = curInvokeCancel
+	defer invokeCancelAndDetachFn()
+	m.invokeCancel = invokeCancelAndDetachFn
 
-	cfg.Stdin = containerIn.stdin
-	cfg.Stdout = containerIn.stdout
-	cfg.Stderr = containerIn.stderr
-	err := build.Invoke(invokeCtx, cfg)
+	err := m.Invoke(invokeCtx, m.AttachedSessionID(), pid, cfg, containerIn.Stdin, containerIn.Stdout, containerIn.Stderr)
 	close(waitInvokeDoneCh)
 
 	return err
 }
 
-type ioForwarder struct {
-	curIO    *ioSetOut
-	mu       sync.Mutex
-	updateCh chan struct{}
+type nopCloser struct {
+	io.Writer
 }
 
-func newIOForwarder(in ioSetIn) *ioForwarder {
-	f := &ioForwarder{
-		updateCh: make(chan struct{}),
-	}
-	doneCh := make(chan struct{})
-	go func() {
-		for {
-			f.mu.Lock()
-			w := f.curIO
-			f.mu.Unlock()
-			if w != nil && w.stdout != nil && w.stderr != nil {
-				go func() {
-					if _, err := io.Copy(in.stdout, w.stdout); err != nil && err != io.ErrClosedPipe {
-						// ErrClosedPipe is OK as we close this read end during setDestination.
-						logrus.WithError(err).Warnf("failed to forward stdout: %v", err)
-					}
-				}()
-				go func() {
-					if _, err := io.Copy(in.stderr, w.stderr); err != nil && err != io.ErrClosedPipe {
-						// ErrClosedPipe is OK as we close this read end during setDestination.
-						logrus.WithError(err).Warnf("failed to forward stderr: %v", err)
-					}
-				}()
-			}
-			select {
-			case <-f.updateCh:
-			case <-doneCh:
-				return
-			}
-		}
-	}()
-	go func() {
-		if err := copyToFunc(in.stdin, func() (io.Writer, error) {
-			f.mu.Lock()
-			w := f.curIO
-			f.mu.Unlock()
-			if w != nil {
-				return w.stdin, nil
-			}
-			return nil, nil
-		}); err != nil && err != io.ErrClosedPipe {
-			logrus.WithError(err).Warnf("failed to forward IO: %v", err)
-		}
-		close(doneCh)
-
-		if w := f.curIO; w != nil {
-			// Propagate close
-			if err := w.Close(); err != nil {
-				logrus.WithError(err).Warnf("failed to forwarded stdin IO: %v", err)
-			}
-		}
-	}()
-	return f
-}
-
-func (f *ioForwarder) setDestination(out *ioSetOut) {
-	f.mu.Lock()
-	if f.curIO != nil {
-		// close all stream on the current IO no to mix with the new IO
-		f.curIO.Close()
-	}
-	f.curIO = out
-	f.mu.Unlock()
-	f.updateCh <- struct{}{}
-}
-
-type ioSetOutContext struct {
-	ioSetOut
-	enableHook  func()
-	disableHook func()
-}
-
-// newMuxIO forwards IO stream to/from "in" and "outs".
-// "outs" are closed automatically when "in" reaches EOF.
-// "in" doesn't closed automatically so the caller needs to explicitly close it.
-func newMuxIO(in ioSetIn, out []ioSetOutContext, initIdx int, toggleMessage func(prev int, res int) string) *muxIO {
-	m := &muxIO{
-		enabled:       make(map[int]struct{}),
-		in:            in,
-		out:           out,
-		closedCh:      make(chan struct{}),
-		toggleMessage: toggleMessage,
-	}
-	for i := range out {
-		m.enabled[i] = struct{}{}
-	}
-	m.maxCur = len(out)
-	m.cur = initIdx
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for i, o := range out {
-		i, o := i, o
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := copyToFunc(o.stdout, func() (io.Writer, error) {
-				if m.cur == i {
-					return in.stdout, nil
-				}
-				return nil, nil
-			}); err != nil {
-				logrus.WithField("output index", i).WithError(err).Warnf("failed to write stdout")
-			}
-			if err := o.stdout.Close(); err != nil {
-				logrus.WithField("output index", i).WithError(err).Warnf("failed to close stdout")
-			}
-		}()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := copyToFunc(o.stderr, func() (io.Writer, error) {
-				if m.cur == i {
-					return in.stderr, nil
-				}
-				return nil, nil
-			}); err != nil {
-				logrus.WithField("output index", i).WithError(err).Warnf("failed to write stderr")
-			}
-			if err := o.stderr.Close(); err != nil {
-				logrus.WithField("output index", i).WithError(err).Warnf("failed to close stderr")
-			}
-		}()
-	}
-	go func() {
-		errToggle := errors.Errorf("toggle IO")
-		for {
-			prevIsControlSequence := false
-			if err := copyToFunc(traceReader(in.stdin, func(r rune) (bool, error) {
-				// Toggle IO when it detects C-a-c
-				// TODO: make it configurable if needed
-				if int(r) == 1 {
-					prevIsControlSequence = true
-					return false, nil
-				}
-				defer func() { prevIsControlSequence = false }()
-				if prevIsControlSequence {
-					if string(r) == "c" {
-						return false, errToggle
-					}
-				}
-				return true, nil
-			}), func() (io.Writer, error) {
-				mu.Lock()
-				o := out[m.cur]
-				mu.Unlock()
-				return o.stdin, nil
-			}); !errors.Is(err, errToggle) {
-				if err != nil {
-					logrus.WithError(err).Warnf("failed to read stdin")
-				}
-				break
-			}
-			m.toggleIO()
-		}
-
-		// propagate stdin EOF
-		for i, o := range out {
-			if err := o.stdin.Close(); err != nil {
-				logrus.WithError(err).Warnf("failed to close stdin of %d", i)
-			}
-		}
-		wg.Wait()
-		close(m.closedCh)
-	}()
-	return m
-}
-
-type muxIO struct {
-	cur           int
-	maxCur        int
-	enabled       map[int]struct{}
-	mu            sync.Mutex
-	in            ioSetIn
-	out           []ioSetOutContext
-	closedCh      chan struct{}
-	toggleMessage func(prev int, res int) string
-}
-
-func (m *muxIO) waitClosed() {
-	<-m.closedCh
-}
-
-func (m *muxIO) enable(i int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.enabled[i] = struct{}{}
-}
-
-func (m *muxIO) disable(i int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if i == 0 {
-		return errors.Errorf("disabling 0th io is prohibited")
-	}
-	delete(m.enabled, i)
-	if m.cur == i {
-		m.toggleIO()
-	}
-	return nil
-}
-
-func (m *muxIO) toggleIO() {
-	if m.out[m.cur].disableHook != nil {
-		m.out[m.cur].disableHook()
-	}
-	prev := m.cur
-	for {
-		if m.cur+1 >= m.maxCur {
-			m.cur = 0
-		} else {
-			m.cur++
-		}
-		if _, ok := m.enabled[m.cur]; !ok {
-			continue
-		}
-		break
-	}
-	res := m.cur
-	if m.out[m.cur].enableHook != nil {
-		m.out[m.cur].enableHook()
-	}
-	fmt.Fprint(m.in.stdout, m.toggleMessage(prev, res))
-}
-
-func traceReader(r io.ReadCloser, f func(rune) (bool, error)) io.ReadCloser {
-	pr, pw := io.Pipe()
-	go func() {
-		br := bufio.NewReader(r)
-		for {
-			rn, _, err := br.ReadRune()
-			if err != nil {
-				if err == io.EOF {
-					pw.Close()
-					return
-				}
-				pw.CloseWithError(err)
-				return
-			}
-			if isWrite, err := f(rn); err != nil {
-				pw.CloseWithError(err)
-				return
-			} else if !isWrite {
-				continue
-			}
-			if _, err := pw.Write([]byte(string(rn))); err != nil {
-				pw.CloseWithError(err)
-				return
-			}
-		}
-	}()
-	return &readerWithClose{
-		Reader: pr,
-		closeFunc: func() error {
-			pr.Close()
-			return r.Close()
-		},
-	}
-}
-
-func copyToFunc(r io.Reader, wFunc func() (io.Writer, error)) error {
-	buf := make([]byte, 4096)
-	for {
-		n, readErr := r.Read(buf)
-		if readErr != nil && readErr != io.EOF {
-			return readErr
-		}
-		w, err := wFunc()
-		if err != nil {
-			return err
-		}
-		if w != nil {
-			if _, err := w.Write(buf[:n]); err != nil {
-				logrus.WithError(err).Debugf("failed to copy")
-			}
-		}
-		if readErr == io.EOF {
-			return nil
-		}
-	}
-}
-
-func ioSetPipe() (ioSetIn, ioSetOut) {
-	r1, w1 := io.Pipe()
-	r2, w2 := io.Pipe()
-	r3, w3 := io.Pipe()
-	return ioSetIn{r1, w2, w3}, ioSetOut{w1, r2, r3}
-}
-
-type ioSetIn struct {
-	stdin  io.ReadCloser
-	stdout io.WriteCloser
-	stderr io.WriteCloser
-}
-
-func (s ioSetIn) Close() (retErr error) {
-	if err := s.stdin.Close(); err != nil {
-		retErr = err
-	}
-	if err := s.stdout.Close(); err != nil {
-		retErr = err
-	}
-	if err := s.stderr.Close(); err != nil {
-		retErr = err
-	}
-	return
-}
-
-type ioSetOut struct {
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.ReadCloser
-}
-
-func (s ioSetOut) Close() (retErr error) {
-	if err := s.stdin.Close(); err != nil {
-		retErr = err
-	}
-	if err := s.stdout.Close(); err != nil {
-		retErr = err
-	}
-	if err := s.stderr.Close(); err != nil {
-		retErr = err
-	}
-	return
-}
-
-type readerWithClose struct {
-	io.Reader
-	closeFunc func() error
-}
-
-func (r *readerWithClose) Close() error {
-	return r.closeFunc()
-}
+func (c nopCloser) Close() error { return nil }

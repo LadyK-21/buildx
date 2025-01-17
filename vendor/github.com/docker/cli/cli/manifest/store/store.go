@@ -2,14 +2,13 @@ package store
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/manifest/types"
 	"github.com/docker/distribution/manifest/manifestlist"
-	"github.com/docker/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -136,12 +135,12 @@ func (s *fsStore) Save(listRef reference.Reference, manifest reference.Reference
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filename, bytes, 0644)
+	return os.WriteFile(filename, bytes, 0o644)
 }
 
 func (s *fsStore) createManifestListDirectory(transaction string) error {
 	path := filepath.Join(s.root, makeFilesafeName(transaction))
-	return os.MkdirAll(path, 0755)
+	return os.MkdirAll(path, 0o755)
 }
 
 func manifestToFilename(root, manifestList, manifest string) string {
@@ -149,8 +148,8 @@ func manifestToFilename(root, manifestList, manifest string) string {
 }
 
 func makeFilesafeName(ref string) string {
-	fileName := strings.Replace(ref, ":", "-", -1)
-	return strings.Replace(fileName, "/", "_", -1)
+	fileName := strings.ReplaceAll(ref, ":", "-")
+	return strings.ReplaceAll(fileName, "/", "_")
 }
 
 type notFoundError struct {
@@ -162,7 +161,7 @@ func newNotFoundError(ref string) *notFoundError {
 }
 
 func (n *notFoundError) Error() string {
-	return fmt.Sprintf("No such manifest: %s", n.object)
+	return "No such manifest: " + n.object
 }
 
 // NotFound interface

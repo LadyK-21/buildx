@@ -7,13 +7,14 @@ import (
 	"os"
 	"strings"
 
-	"github.com/docker/buildx/store"
-	"github.com/docker/buildx/store/storeutil"
+	"github.com/distribution/reference"
+	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/util/buildflags"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/distribution/reference"
-	"github.com/moby/buildkit/util/appcontext"
+	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -25,12 +26,14 @@ type createOptions struct {
 	builder      string
 	files        []string
 	tags         []string
+	annotations  []string
 	dryrun       bool
 	actionAppend bool
 	progress     string
+	preferIndex  bool
 }
 
-func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
+func runCreate(ctx context.Context, dockerCli command.Cli, in createOptions, args []string) error {
 	if len(args) == 0 && len(in.files) == 0 {
 		return errors.Errorf("no sources specified")
 	}
@@ -39,7 +42,7 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 		return errors.Errorf("can't push with no tags specified, please set --tag or --dry-run")
 	}
 
-	fileArgs := make([]string, len(in.files))
+	fileArgs := make([]string, len(in.files), len(in.files)+len(args))
 	for i, f := range in.files {
 		dt, err := os.ReadFile(f)
 		if err != nil {
@@ -90,47 +93,32 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 	}
 
 	for i, s := range srcs {
-		if s.Ref == nil && s.Desc.MediaType == "" && s.Desc.Digest != "" {
+		if s.Ref == nil {
 			if defaultRepo == nil {
 				return errors.Errorf("multiple repositories specified, cannot infer repository for %q", args[i])
 			}
-
 			n, err := reference.ParseNormalizedNamed(*defaultRepo)
 			if err != nil {
 				return err
 			}
-			r, err := reference.WithDigest(n, s.Desc.Digest)
-			if err != nil {
-				return err
+			if s.Desc.MediaType == "" && s.Desc.Digest != "" {
+				r, err := reference.WithDigest(n, s.Desc.Digest)
+				if err != nil {
+					return err
+				}
+				srcs[i].Ref = r
+				sourceRefs = true
+			} else {
+				srcs[i].Ref = reference.TagNameOnly(n)
 			}
-			srcs[i].Ref = r
-			sourceRefs = true
 		}
 	}
 
-	ctx := appcontext.Context()
-
-	txn, release, err := storeutil.GetStore(dockerCli)
+	b, err := builder.New(dockerCli, builder.WithName(in.builder))
 	if err != nil {
 		return err
 	}
-	defer release()
-
-	var ng *store.NodeGroup
-
-	if in.builder != "" {
-		ng, err = storeutil.GetNodeGroup(txn, dockerCli, in.builder)
-		if err != nil {
-			return err
-		}
-	} else {
-		ng, err = storeutil.GetCurrentInstance(txn, dockerCli)
-		if err != nil {
-			return err
-		}
-	}
-
-	imageopt, err := storeutil.GetImageConfig(dockerCli, ng)
+	imageopt, err := b.ImageOpt()
 	if err != nil {
 		return err
 	}
@@ -167,7 +155,12 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 		}
 	}
 
-	dt, desc, err := r.Combine(ctx, srcs)
+	annotations, err := buildflags.ParseAnnotations(in.annotations)
+	if err != nil {
+		return errors.Wrapf(err, "failed to parse annotations")
+	}
+
+	dt, desc, err := r.Combine(ctx, srcs, annotations, in.preferIndex)
 	if err != nil {
 		return err
 	}
@@ -180,9 +173,12 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 	// new resolver cause need new auth
 	r = imagetools.New(imageopt)
 
-	ctx2, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-	printer := progress.NewPrinter(ctx2, os.Stderr, os.Stderr, in.progress)
+	ctx2, cancel := context.WithCancelCause(context.TODO())
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
+	printer, err := progress.NewPrinter(ctx2, os.Stderr, progressui.DisplayMode(in.progress))
+	if err != nil {
+		return err
+	}
 
 	eg, _ := errgroup.WithContext(ctx)
 	pw := progress.WithPrefix(printer, "internal", true)
@@ -282,8 +278,9 @@ func createCmd(dockerCli command.Cli, opts RootOptions) *cobra.Command {
 		Short: "Create a new image based on source images",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.builder = *opts.Builder
-			return runCreate(dockerCli, options, args)
+			return runCreate(cmd.Context(), dockerCli, options, args)
 		},
+		ValidArgsFunction: completion.Disable,
 	}
 
 	flags := cmd.Flags()
@@ -291,7 +288,9 @@ func createCmd(dockerCli command.Cli, opts RootOptions) *cobra.Command {
 	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, "Set reference for new image")
 	flags.BoolVar(&options.dryrun, "dry-run", false, "Show final image instead of pushing")
 	flags.BoolVar(&options.actionAppend, "append", false, "Append to existing manifest")
-	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty"). Use plain to show container output`)
+	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty", "rawjson"). Use plain to show container output`)
+	flags.StringArrayVarP(&options.annotations, "annotation", "", []string{}, "Add annotation to the image")
+	flags.BoolVar(&options.preferIndex, "prefer-index", true, "When only a single source is specified, prefer outputting an image index or manifest list instead of performing a carbon copy")
 
 	return cmd
 }

@@ -28,7 +28,7 @@ func (c *Client) ListWorkers(ctx context.Context, opts ...ListWorkersOption) ([]
 	}
 
 	req := &controlapi.ListWorkersRequest{Filter: info.Filter}
-	resp, err := c.controlClient().ListWorkers(ctx, req)
+	resp, err := c.ControlClient().ListWorkers(ctx, req)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list workers")
 	}
@@ -62,10 +62,12 @@ func fromAPIGCPolicy(in []*apitypes.GCPolicy) []PruneInfo {
 	out := make([]PruneInfo, 0, len(in))
 	for _, p := range in {
 		out = append(out, PruneInfo{
-			All:          p.All,
-			Filter:       p.Filters,
-			KeepDuration: time.Duration(p.KeepDuration),
-			KeepBytes:    p.KeepBytes,
+			All:           p.All,
+			Filter:        p.Filters,
+			KeepDuration:  time.Duration(p.KeepDuration),
+			ReservedSpace: p.ReservedSpace,
+			MaxUsedSpace:  p.MaxUsedSpace,
+			MinFreeSpace:  p.MinFreeSpace,
 		})
 	}
 	return out

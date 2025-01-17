@@ -9,11 +9,12 @@ Set the current builder instance
 
 ### Options
 
-| Name | Type | Default | Description |
-| --- | --- | --- | --- |
-| [`--builder`](#builder) | `string` |  | Override the configured builder instance |
-| `--default` |  |  | Set builder as default for current context |
-| `--global` |  |  | Builder persists context changes |
+| Name                    | Type     | Default | Description                                |
+|:------------------------|:---------|:--------|:-------------------------------------------|
+| [`--builder`](#builder) | `string` |         | Override the configured builder instance   |
+| `-D`, `--debug`         | `bool`   |         | Enable debug logging                       |
+| `--default`             | `bool`   |         | Set builder as default for current context |
+| `--global`              | `bool`   |         | Builder persists context changes           |
 
 
 <!---MARKER_GEN_END-->
